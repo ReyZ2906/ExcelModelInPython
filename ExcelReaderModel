@@ -11,8 +11,6 @@ from typing import Dict, List, Optional
 import pandas as pd
 from openpyxl.styles import PatternFill, Border, Side, Font, Alignment
 from openpyxl.utils import get_column_letter
-from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
-from openpyxl.utils.exceptions import IllegalCharacterError
 
 # -------------------------------------------------------------------
 # Logging
@@ -35,9 +33,8 @@ OUTPUT_XLSX = PROJECT_ROOT / "validation_results.xlsx"
 
 CSV_DIR.mkdir(exist_ok=True)
 
-
 # -------------------------------------------------------------------
-# File type helpers
+# File-type helpers
 # -------------------------------------------------------------------
 def _is_zip_file(p: pathlib.Path) -> bool:
     try:
@@ -71,8 +68,7 @@ def _read_excel_as_text(path: pathlib.Path) -> pd.DataFrame:
         return pd.read_csv(path, sep="|", dtype=str, engine="python")
 
     raise ValueError(
-        f"Cannot determine format of '{path}'. "
-        "Supported: .xlsx, .xlsm, .xls, or a pipe-delimited text file."
+        f"Cannot determine format of '{path}'. Supported: xlsx/xlsm/xls/txt(pipe)."
     )
 
 
@@ -80,40 +76,62 @@ def _convert_to_csv(src_path: pathlib.Path) -> Optional[pathlib.Path]:
     csv_path = CSV_DIR / (src_path.stem + ".csv")
 
     if _is_text_file(src_path):
-        if not csv_path.is_file():
+        if not csv_path.exists():
             src_path.rename(csv_path)
-            log.info(f"Renamed text file to CSV: {src_path.name} -> {csv_path.name}")
-        else:
-            log.info(f"CSV already exists, skipping rename: {csv_path.name}")
+            log.info(f"Renamed text to CSV: {src_path.name} -> {csv_path.name}")
         return csv_path
 
-    if csv_path.is_file():
+    if csv_path.exists():
         return csv_path
 
     try:
         df = _read_excel_as_text(src_path)
-        df.to_csv(csv_path, sep="|", index=False, header=True)
-        log.info(f"Converted {src_path.name} -> {csv_path.name}")
+        df.to_csv(csv_path, sep="|", index=False)
+        log.info(f"Converted {src_path.name} → {csv_path.name}")
     except Exception as exc:
-        log.error(f"Failed to convert {src_path.name} to CSV: {exc}")
+        log.error(f"Failed to convert {src_path.name}: {exc}")
         return None
 
     return csv_path
 
 
 # -------------------------------------------------------------------
-# Normalisation / cleaning
+# Cleaning helpers (strict XML-safe)
+# -------------------------------------------------------------------
+def _clean_excel_string(value):
+    if not isinstance(value, str):
+        return value
+
+    def allowed(ch):
+        cp = ord(ch)
+        return (
+            cp == 0x9
+            or cp == 0xA
+            or cp == 0xD
+            or 0x20 <= cp <= 0xD7FF
+            or 0xE000 <= cp <= 0xFFFD
+            or 0x10000 <= cp <= 0x10FFFF
+        )
+
+    return "".join(ch for ch in value if allowed(ch))
+
+
+def _sanitize_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return df.applymap(_clean_excel_string)
+
+
+# -------------------------------------------------------------------
+# Normalisation
 # -------------------------------------------------------------------
 def _normalise_column_name(name: str) -> str:
     return name.replace("\u00a0", " ").replace("\u202f", " ").strip()
 
 
 def _normalise_status_column(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure there is an 'AUTOMATION STATUS' column.
-    We do NOT change its meaning – only header + dtype.
-    """
     candidates = [c for c in df.columns if "automation" in c.lower() and "status" in c.lower()]
+
     if not candidates:
         df["AUTOMATION STATUS"] = ""
     else:
@@ -124,57 +142,16 @@ def _normalise_status_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _clean_excel_string(value):
-    """
-    Make a value 100% safe for Excel:
-    - remove known illegal chars via openpyxl regex
-    - drop any non-printable control characters
-    """
-    if not isinstance(value, str):
-        return value
-
-    # remove XML-illegal control chars
-    value = ILLEGAL_CHARACTERS_RE.sub("", value)
-
-    # drop everything that is not a "reasonable" printable char
-    safe_chars = []
-    for ch in value:
-        code = ord(ch)
-        # keep tab/newline/carriage-return
-        if ch in ("\t", "\n", "\r"):
-            safe_chars.append(ch)
-        # keep basic printable range
-        elif 32 <= code <= 126:
-            safe_chars.append(ch)
-        # optionally keep extended latin letters if you want:
-        elif 160 <= code <= 255:
-            safe_chars.append(ch)
-        # else: skip
-    return "".join(safe_chars)
-
-
-def _sanitize_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    return df.applymap(_clean_excel_string)
-
-
-def _mark_script_status(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Second status column: SCRIPT STATUS
-    - if any cell in a row looks like a formula (=...), mark as 'Read Error'
-    """
-    if df is None or df.empty:
-        return df
-
-    if "SCRIPT STATUS" not in df.columns:
-        df["SCRIPT STATUS"] = ""
+def _mark_status_read_error(df: pd.DataFrame) -> pd.DataFrame:
+    """Mark rows with formulas as READ ERROR (Status column)"""
+    if "Status" not in df.columns:
+        df["Status"] = ""
 
     formula_mask = df.applymap(
         lambda v: isinstance(v, str) and v.startswith("=")
     ).any(axis=1)
 
-    df.loc[formula_mask, "SCRIPT STATUS"] = "Read Error"
+    df.loc[formula_mask, "Status"] = "READ ERROR"
     return df
 
 
@@ -183,21 +160,13 @@ def _mark_script_status(df: pd.DataFrame) -> pd.DataFrame:
 # -------------------------------------------------------------------
 def _load_csv(path: pathlib.Path, source_label: str) -> pd.DataFrame:
     id_col = "CORTEX DEPOSIT DEAL ID"
+
     try:
-        df = pd.read_csv(
-            path,
-            sep="|",
-            dtype=str,
-            engine="python",
-            on_bad_lines="warn",  # don't die on malformed lines
-        )
+        df = pd.read_csv(path, sep="|", dtype=str, engine="python", on_bad_lines="warn")
         df["Report"] = source_label
 
         if id_col not in df.columns:
-            raise KeyError(
-                f"The column '{id_col}' is missing from CSV {path.name}. "
-                f"Available columns: {list(df.columns)}"
-            )
+            raise KeyError(f"{id_col} missing in {path.name}")
 
         df[id_col] = (
             df[id_col]
@@ -209,142 +178,134 @@ def _load_csv(path: pathlib.Path, source_label: str) -> pd.DataFrame:
         )
 
         df = _normalise_status_column(df)
-        df = _mark_script_status(df)
+        df = _mark_status_read_error(df)
+
+        # Default Status for loaded rows that are not formulas
+        df.loc[df["Status"] == "", "Status"] = "FOUND"
 
         return df
 
     except Exception as exc:
-        log.error(f"Failed to load CSV {path.name}: {exc}")
-        # represent file as a single Read Error row
+        log.error(f"CSV read failure {path.name}: {exc}")
+
         return pd.DataFrame(
             [{
                 id_col: f"READ_ERROR::{path.name}",
                 "AUTOMATION STATUS": "",
-                "SCRIPT STATUS": "Read Error",
+                "Status": "READ ERROR",
                 "Report": source_label,
             }]
         )
 
 
 # -------------------------------------------------------------------
-# Styling helpers
+# Styling
 # -------------------------------------------------------------------
-def _style_worksheet(ws, status_col_idx: Optional[int] = None) -> None:
+def _style_worksheet(ws, status_col_idx: Optional[int]):
     thin = Side(border_style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+    for row in ws.iter_rows():
         for cell in row:
             cell.border = border
 
     header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF")
-    header_alignment = Alignment(horizontal="center", vertical="center")
-
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = header_alignment
+        cell.alignment = Alignment(horizontal="center")
 
-    if status_col_idx is not None:
-        status_letter = get_column_letter(status_col_idx)
-        success_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-        failure_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-        read_error_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+    if status_col_idx:
+        col_letter = get_column_letter(status_col_idx)
 
-        for cell in ws[status_letter][1:]:
-            val = str(cell.value).strip().lower()
-            if val == "success":
-                cell.fill = success_fill
-            elif val in ("failure", "failed"):
-                cell.fill = failure_fill
-            elif val == "read error":
-                cell.fill = read_error_fill
+        green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        red_font = Font(color="FF0000")
 
+        for cell in ws[col_letter][1:]:
+            v = str(cell.value).strip().upper()
+
+            if v == "FOUND":
+                cell.fill = green
+
+            elif v == "NOT FOUND":
+                cell.fill = red
+
+            elif v == "READ ERROR":
+                cell.fill = yellow
+                cell.font = red_font
+
+    # Auto width
     for col in ws.columns:
-        max_len = 0
-        column = col[0].column_letter
-        for cell in col:
-            if cell.value is None:
-                continue
-            max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[column].width = max_len + 2
+        length = max(len(str(c.value) if c.value else "") for c in col)
+        ws.column_dimensions[col[0].column_letter].width = length + 2
 
 
-def _get_status_column_index(ws, header_name: str) -> Optional[int]:
-    for idx, cell in enumerate(ws[1], start=1):
-        if str(cell.value).strip().lower() == header_name.strip().lower():
-            return idx
+def _get_status_col(ws, header="Status"):
+    for i, cell in enumerate(ws[1], start=1):
+        if str(cell.value).strip().lower() == header.lower():
+            return i
     return None
 
 
-def _write_and_style(
-    df: pd.DataFrame,
-    writer: pd.ExcelWriter,
-    sheet_name: str,
-    status_header: str,
-) -> None:
-    df.to_excel(writer, index=False, sheet_name=sheet_name)
-    ws = writer.sheets[sheet_name]
-    status_idx = _get_status_column_index(ws, status_header)
-    _style_worksheet(ws, status_col_idx=status_idx)
+def _write_sheet(df, writer, sheet, header="Status"):
+    df.to_excel(writer, index=False, sheet_name=sheet)
+    ws = writer.sheets[sheet]
+    idx = _get_status_col(ws, header)
+    _style_worksheet(ws, idx)
 
 
 # -------------------------------------------------------------------
 # Report discovery
 # -------------------------------------------------------------------
 def find_all_reports() -> Dict[str, List[pathlib.Path]]:
-    raw_patterns = {
+    raw = {
         "success": "FTD_SUCC_DEALS_1_*.xls*",
         "failure": "FTD_FAIL_DEALS_1_*.xls*",
     }
-    zip_patterns = {
-        "success": "Success_*.zip",
-        "failure": "Failure_*.zip",
-    }
 
-    csv_paths: Dict[str, List[pathlib.Path]] = {"success": [], "failure": []}
-    raw_found = False
+    csv_paths = {"success": [], "failure": []}
 
-    for kind, pat in raw_patterns.items():
-        raw_matches = sorted(DATA_DIR.glob(pat))
-        if raw_matches:
-            raw_found = True
-            csv_paths[kind] = [
-                _convert_to_csv(p) for p in raw_matches if _convert_to_csv(p) is not None
-            ]
+    found_raw = False
+    for kind, pattern in raw.items():
+        matches = list(DATA_DIR.glob(pattern))
+        if matches:
+            found_raw = True
+            for m in matches:
+                c = _convert_to_csv(m)
+                if c:
+                    csv_paths[kind].append(c)
 
-    if not raw_found:
-        for kind, pat in zip_patterns.items():
-            zip_matches = sorted(DATA_DIR.glob(pat))
-            if not zip_matches:
-                continue
-            for zpath in zip_matches:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    tmp_dir = pathlib.Path(tmpdir)
-                    with zipfile.ZipFile(zpath, "r") as zf:
-                        zf.extractall(tmp_dir)
-
-                    for ef in tmp_dir.rglob("*"):
-                        if ef.suffix.lower() in (".xls", ".xlsx", ".xlsm", ".txt"):
-                            dest = DATA_DIR / ef.name
-                            shutil.move(str(ef), dest)
-                            converted = _convert_to_csv(dest)
-                            if converted is not None:
-                                csv_paths[kind].append(converted)
-
-    if any(csv_paths.values()):
-        return csv_paths
-
-    csv_patterns = {
-        "success": "FTD_SUCC_DEALS_1_*.csv",
-        "failure": "FTD_FAIL_DEALS_1_*.csv",
-    }
-    for kind, pat in csv_patterns.items():
-        csv_paths[kind] = sorted(CSV_DIR.glob(pat))
+    if not found_raw:
+        # ZIP extraction
+        zip_patterns = {
+            "success": "Success_*.zip",
+            "failure": "Failure_*.zip",
+        }
+        for kind, pattern in zip_patterns.items():
+            for z in DATA_DIR.glob(pattern):
+                with tempfile.TemporaryDirectory() as t:
+                    tmp = pathlib.Path(t)
+                    with zipfile.ZipFile(z, "r") as zf:
+                        zf.extractall(tmp)
+                    for f in tmp.rglob("*"):
+                        if f.suffix.lower() in (".xls", ".xlsx", ".xlsm", ".txt"):
+                            dest = DATA_DIR / f.name
+                            shutil.move(str(f), dest)
+                            c = _convert_to_csv(dest)
+                            if c:
+                                csv_paths[kind].append(c)
 
     if not any(csv_paths.values()):
-        raise FileNotFoundError(f"No CSV file matching expected patterns in {CSV_DIR}")
+        # fallback direct CSV
+        fallback = {
+            "success": "FTD_SUCC_DEALS_1_*.csv",
+            "failure": "FTD_FAIL_DEALS_1_*.csv",
+        }
+        for kind, pattern in fallback.items():
+            csv_paths[kind] = list(CSV_DIR.glob(pattern))
 
     return csv_paths
 
@@ -353,28 +314,11 @@ def find_all_reports() -> Dict[str, List[pathlib.Path]]:
 # Deal IDs
 # -------------------------------------------------------------------
 def _load_deal_ids() -> List[str]:
-    DEAL_ID_SHEET = "DealIDs"
-    DEAL_ID_COLUMN = "CORTEX DEPOSIT DEAL ID"
-
-    if not DEAL_ID_XLSX.is_file():
-        raise FileNotFoundError(f"Deal-ID workbook not found: {DEAL_ID_XLSX}")
-
-    df = pd.read_excel(
-        DEAL_ID_XLSX,
-        sheet_name=DEAL_ID_SHEET,
-        dtype=str,
-        engine="openpyxl",
-    )
-    df.columns = [_normalise_column_name(col) for col in df.columns]
-
-    if DEAL_ID_COLUMN not in df.columns:
-        raise KeyError(
-            f"Column '{DEAL_ID_COLUMN}' not found after normalisation. "
-            f"Available columns: {list(df.columns)}"
-        )
-
+    df = pd.read_excel(DEAL_ID_XLSX, sheet_name="DealIDs", dtype=str)
+    df.columns = [_normalise_column_name(c) for c in df.columns]
+    col = "CORTEX DEPOSIT DEAL ID"
     return (
-        df[DEAL_ID_COLUMN]
+        df[col]
         .dropna()
         .astype(str)
         .str.strip()
@@ -388,139 +332,85 @@ def _load_deal_ids() -> List[str]:
 # -------------------------------------------------------------------
 # Result frame
 # -------------------------------------------------------------------
-def _build_result_frame(
-    deal_ids: List[str],
-    combined: pd.DataFrame,
-    id_col: str = "CORTEX DEPOSIT DEAL ID",
-) -> pd.DataFrame:
-    if combined is None:
-        combined = pd.DataFrame()
-
-    if "SCRIPT STATUS" not in combined.columns:
-        combined["SCRIPT STATUS"] = ""
-
-    original_cols = [c for c in combined.columns if c != "Report"]
-
-    rows: List[dict] = []
+def _build_result_frame(deal_ids, combined):
+    rows = []
 
     for did in deal_ids:
-        match = combined[combined[id_col] == did]
+        match = combined[combined["CORTEX DEPOSIT DEAL ID"] == did]
 
         if not match.empty:
-            row_dict = match.iloc[0].to_dict()
-            row_dict.pop("Report", None)
-            status = "Success"
+            row = match.iloc[0].to_dict()
+            row.pop("Report", None)
+
+            # default FOUND
+            status = "FOUND"
+
+            # but READ ERROR overrides everything
+            if any(match["Status"].str.upper() == "READ ERROR"):
+                status = "READ ERROR"
+
         else:
-            row_dict = {c: "" for c in original_cols}
-            status = "Failure"
+            # deal not found
+            row = {c: "" for c in combined.columns if c != "Report"}
+            status = "NOT FOUND"
 
-        rows.append(
-            {
-                "Deals-To-Check": did,
-                "Status": status,
-                **row_dict,
-            }
-        )
+        rows.append({"Deals-To-Check": did, "Status": status, **row})
 
-    final_cols = ["Deals-To-Check", "Status"]
-    if "SCRIPT STATUS" in original_cols:
-        final_cols.append("SCRIPT STATUS")
-        original_cols = [c for c in original_cols if c != "SCRIPT STATUS"]
-    final_cols.extend(original_cols)
+    # Column order
+    cols = ["Deals-To-Check", "Status"] + [
+        c for c in combined.columns if c not in ("Report", "Status")
+    ]
 
-    return pd.DataFrame(rows, columns=final_cols)
+    return pd.DataFrame(rows, columns=cols)
 
 
 # -------------------------------------------------------------------
-# Main
+# MAIN
 # -------------------------------------------------------------------
-def main() -> None:
-    csv_paths = find_all_reports()
-    log.info("CSV files that will be processed:")
-    for kind, paths in csv_paths.items():
-        for p in paths:
-            log.info(f"  {kind.title():7} -> {p.name}")
+def main():
 
+    csvs = find_all_reports()
     deal_ids = _load_deal_ids()
-    if not deal_ids:
-        log.warning("No Deal IDs found - exiting.")
-        return
 
-    log.info(f"Number of Deal IDs to validate: {len(deal_ids)}")
+    success_frames = [_load_csv(p, "Success") for p in csvs["success"]]
+    failure_frames = [_load_csv(p, "Failure") for p in csvs["failure"]]
 
-    success_frames = [_load_csv(p, "Success") for p in csv_paths["success"]]
-    success_frames = [df for df in success_frames if df is not None and not df.empty]
-    success_df = pd.concat(success_frames, ignore_index=True) if success_frames else pd.DataFrame()
-
-    failure_frames = [_load_csv(p, "Failure") for p in csv_paths["failure"]]
-    failure_frames = [df for df in failure_frames if df is not None and not df.empty]
-    failure_df = pd.concat(failure_frames, ignore_index=True) if failure_frames else pd.DataFrame()
+    success_df = pd.concat(success_frames) if success_frames else pd.DataFrame()
+    failure_df = pd.concat(failure_frames) if failure_frames else pd.DataFrame()
 
     if not success_df.empty and not failure_df.empty:
         combined = pd.concat([success_df, failure_df], ignore_index=True)
-    elif not success_df.empty:
-        combined = success_df
-    elif not failure_df.empty:
-        combined = failure_df
     else:
-        log.warning("No usable data from success/failure CSVs.")
-        combined = pd.DataFrame()
+        combined = success_df if not success_df.empty else failure_df
 
-    allmatched_df = _build_result_frame(deal_ids, combined)
+    allmatched = _build_result_frame(deal_ids, combined)
 
-    if "AUTOMATION STATUS" not in allmatched_df.columns:
-        allmatched_df["AUTOMATION STATUS"] = ""
+    # sanitize final
+    allmatched = _sanitize_dataframe_for_excel(allmatched)
 
+    # bifurcation uses AUTOMATION STATUS
     success_mask = (
-        (allmatched_df["Status"].str.upper() == "SUCCESS")
-        & (allmatched_df["AUTOMATION STATUS"].str.upper() == "SUCCESS")
+        (allmatched["Status"] == "FOUND")
+        & (allmatched["AUTOMATION STATUS"].str.upper() == "SUCCESS")
     )
-    allmatched_success = allmatched_df[success_mask]
 
     fail_mask = (
-        (allmatched_df["Status"].str.upper() == "SUCCESS")
-        & (allmatched_df["AUTOMATION STATUS"].str.upper().isin(["FAILED", "FAILURE"]))
+        (allmatched["Status"] == "FOUND")
+        & (allmatched["AUTOMATION STATUS"].str.upper().isin(["FAILED", "FAILURE"]))
     )
-    allmatched_fail = allmatched_df[fail_mask]
 
-    # FINAL sanitise before Excel write
-    allmatched_df = _sanitize_dataframe_for_excel(allmatched_df)
-    allmatched_success = _sanitize_dataframe_for_excel(allmatched_success)
-    allmatched_fail = _sanitize_dataframe_for_excel(allmatched_fail)
+    matched_success = allmatched[success_mask]
+    matched_fail = allmatched[fail_mask]
 
-    try:
-        with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
-            # AllMatched → color by SCRIPT STATUS (second status column)
-            _write_and_style(
-                allmatched_df,
-                writer,
-                sheet_name="AllMatched",
-                status_header="SCRIPT STATUS",
-            )
+    # write final
+    with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
+        _write_sheet(allmatched, writer, "AllMatched", "Status")
+        _write_sheet(matched_success, writer, "AllMatched_Success", "AUTOMATION STATUS")
+        _write_sheet(matched_fail, writer, "AllMatched_Fail", "AUTOMATION STATUS")
 
-            # Bifurcated sheets → color by AUTOMATION STATUS
-            _write_and_style(
-                allmatched_success,
-                writer,
-                sheet_name="AllMatched_Success",
-                status_header="AUTOMATION STATUS",
-            )
-            _write_and_style(
-                allmatched_fail,
-                writer,
-                sheet_name="AllMatched_Fail",
-                status_header="AUTOMATION STATUS",
-            )
-
-        log.info(f"Results saved to: {OUTPUT_XLSX}")
-        print(f"Output file generated successfully: {OUTPUT_XLSX}")
-
-    except IllegalCharacterError as exc:
-        # If this ever triggers, we know some char still slipped through
-        log.error(f"Fatal IllegalCharacterError while writing workbook: {exc}")
-        raise
+    print(f"Output Excel generated: {OUTPUT_XLSX}")
+    log.info(f"Output Excel generated: {OUTPUT_XLSX}")
 
 
 if __name__ == "__main__":
     main()
-
